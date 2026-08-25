@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: telegram-cpanel-metadata-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: STREAM_SECRET
+        sync: false
+      - key: CPANEL_WATCH_URL
+        sync: false
+      - key: PUBLIC_BOT_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: TOKEN_TTL_SECONDS
+        value: "2592000"
