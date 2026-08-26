@@ -72,16 +72,8 @@ async def copy_to_database_channel(source_chat_id: int, source_message_id: int) 
 
 
 def make_slug(value: str, fallback_id: int) -> str:
-    cleaned = "".join(
-        ch if ("A" <= ch <= "Z" or "a" <= ch <= "z" or "0" <= ch <= "9" or ch in "_-") else "-"
-        for ch in value
-    ).strip("-")
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    suffix = f"-{fallback_id}"
-    if not cleaned:
-        return f"telegram{suffix}"[:50]
-    prefix = cleaned[:50 - len(suffix)].rstrip("-")
-    return (prefix + suffix)[:50]
+    # Basic stable slug: no filename, Unicode, spaces, or special characters.
+    return f"tg-{int(fallback_id)}"
 
 
 async def save_gdplayer_metadata(record: dict[str, Any]) -> dict[str, Any]:
