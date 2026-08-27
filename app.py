@@ -181,7 +181,7 @@ def validate_prefix(prefix: str) -> bool:
 
 
 def validate_slug(slug: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,239}", slug))
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,49}", slug))
 
 
 def help_text() -> str:
@@ -227,8 +227,16 @@ async def save_gdplayer_metadata(record: dict[str, Any], sources: Optional[list[
     headers = {"X-CPANEL-INGEST-SECRET": CPANEL_INGEST_SECRET}
     async with httpx.AsyncClient(timeout=60) as http:
         response = await http.post(CPANEL_INGEST_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        body = response.json()
+        response_text = response.text[:1000].replace("\n", " ").strip()
+        if response.status_code >= 400:
+            detail = response_text or "empty response"
+            raise RuntimeError(f"cPanel ingest HTTP {response.status_code}: {detail[:500]}")
+        if not response_text:
+            raise RuntimeError(f"cPanel ingest returned empty HTTP {response.status_code} response")
+        try:
+            body = response.json()
+        except ValueError:
+            raise RuntimeError(f"cPanel ingest returned non-JSON HTTP {response.status_code}: {response_text[:500]}")
     if not body.get("ok"):
         raise RuntimeError(body.get("error", "cPanel metadata save failed"))
     return body
@@ -335,9 +343,10 @@ async def handle_single_slug(chat_id: int, slug: str) -> None:
         saved = await save_gdplayer_metadata(record)
         player_url = saved.get("slug_url") or saved.get("embed_url") or f"{CPANEL_WATCH_URL}?token={quote(stream_fields(candidate)['watch_url'].split('token=', 1)[-1], safe='')}"
         await send_bot_message(chat_id, f"✅ Video ready\n\n🔗 {player_url}")
-    except Exception:
+    except Exception as exc:
         logger.exception("Single video processing failed")
-        await send_bot_message(chat_id, "❌ Video save nahi ho paya. cPanel/Telegram setup check karo.")
+        detail = str(exc).replace("\n", " ")[:500]
+        await send_bot_message(chat_id, f"❌ Video save nahi ho paya.\nReason: {detail}")
 
 
 async def handle_bulk_media(chat_id: int, message: dict[str, Any]) -> None:
@@ -400,9 +409,10 @@ async def process_bulk(chat_id: int, prefix: str, items: list[Candidate], invali
                 f"Sources: {', '.join(item.quality + ' • ' + item.audio_language for item in candidates)}\n\n"
                 f"🔗 {saved.get('slug_url') or saved.get('embed_url') or slug}",
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Bulk episode ingest failed for %s", slug)
-            await send_bot_message(chat_id, f"❌ Episode {slug} save nahi ho paya.")
+            detail = str(exc).replace("\n", " ")[:500]
+            await send_bot_message(chat_id, f"❌ Episode {slug} save nahi ho paya.\nReason: {detail}")
     if invalid:
         missing = ", ".join(f"{season}/Episode {episode}" for season, episode in sorted(invalid))
         await send_bot_message(chat_id, f"⚠️ Replacement ke bina incomplete episodes: {missing}")
