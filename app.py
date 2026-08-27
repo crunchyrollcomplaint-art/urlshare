@@ -320,6 +320,8 @@ def source_record(candidate: Candidate, slug: str) -> dict[str, Any]:
 
 
 async def copy_candidate(candidate: Candidate) -> None:
+    if candidate.channel_message_id:
+        return
     copied = await copy_to_database_channel(candidate.source_chat_id, candidate.source_message_id)
     candidate.channel_message_id = int(copied["message_id"])
     copied_media = copied.get("video") or copied.get("document") or {}
@@ -345,8 +347,11 @@ async def handle_single_slug(chat_id: int, slug: str) -> None:
         await send_bot_message(chat_id, f"✅ Video ready\n\n🔗 {player_url}")
     except Exception as exc:
         logger.exception("Single video processing failed")
+        async with state.lock:
+            if state.pending_single is None:
+                state.pending_single = candidate
         detail = str(exc).replace("\n", " ")[:500]
-        await send_bot_message(chat_id, f"❌ Video save nahi ho paya.\nReason: {detail}")
+        await send_bot_message(chat_id, f"❌ Video save nahi ho paya.\nReason: {detail}\n\nSame video ke liye slug dobara bhej sakte ho.")
 
 
 async def handle_bulk_media(chat_id: int, message: dict[str, Any]) -> None:
