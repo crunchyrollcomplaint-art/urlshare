@@ -25,7 +25,8 @@ TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "2592000"))
 TARGET_CHANNEL_ID = int(os.environ["TARGET_CHANNEL_ID"])
 CPANEL_INGEST_URL = os.environ["CPANEL_INGEST_URL"]
 CPANEL_INGEST_SECRET = os.environ["CPANEL_INGEST_SECRET"]
-CPANEL_MEDIA_URL = os.getenv("CPANEL_MEDIA_URL", "https://chalchitra.site/tgstreamnode/media").rstrip("?")
+CPANEL_MEDIA_URL = os.getenv("CPANEL_MEDIA_URL", "https://chalchitra.site/chitraengine/media").rstrip("?")
+CPANEL_PREPARE_URL = os.getenv("CPANEL_PREPARE_URL", "https://chalchitra.site/chitraengine/prepare")
 
 app = FastAPI(title="Telegram cPanel Channel Bot", version="3.0.0")
 
@@ -75,6 +76,17 @@ def make_slug(value: str, fallback_id: int) -> str:
     cleaned = "".join(ch if ch.isalnum() else "-" for ch in value).strip("-")
     cleaned = "-".join(part for part in cleaned.split("-") if part)
     return (cleaned[:240] or f"telegram-{fallback_id}")
+
+
+async def prepare_cpanel_media(record: dict[str, Any]) -> dict[str, Any]:
+    headers = {"X-CPANEL-INGEST-SECRET": CPANEL_INGEST_SECRET}
+    async with httpx.AsyncClient(timeout=30) as http:
+        response = await http.post(CPANEL_PREPARE_URL, json=record, headers=headers)
+        response.raise_for_status()
+        body = response.json()
+    if not body.get("ok"):
+        raise RuntimeError(body.get("error", "cPanel media preparation failed"))
+    return body
 
 
 async def save_gdplayer_metadata(record: dict[str, Any]) -> dict[str, Any]:
@@ -159,6 +171,15 @@ async def process_update(update: dict[str, Any]) -> None:
             "caption": caption,
             "stream_url": stream_url,
         }
+        prepared = await prepare_cpanel_media(record)
+        if prepared.get("mode") == "processing":
+            await send_bot_message(
+                chat_id,
+                "⏳ Video browser-compatible format mein nahi hai.\n\n"
+                "cPanel par automatic conversion start ho gayi hai. Converted file private Telegram channel mein save hone ke baad final GDPlayer link bheja jayega.\n\n"
+                "Render video bytes handle nahi kar raha.",
+            )
+            return
         saved = await save_gdplayer_metadata(record)
         size_text = f"{file_size / (1024 * 1024):.1f} MB" if file_size else "unknown size"
         player_url = saved.get("embed_url") or watch_url
