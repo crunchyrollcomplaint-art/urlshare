@@ -5,7 +5,10 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -18,7 +21,7 @@ logger = logging.getLogger("tg-cpanel-channel-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 STREAM_SECRET = os.environ["STREAM_SECRET"].encode("utf-8")
-CPANEL_WATCH_URL = os.environ["CPANEL_WATCH_URL"].rstrip("?")
+CPANEL_WATCH_URL = os.getenv("CPANEL_WATCH_URL", "https://chalchitra.site/e/").rstrip("?")
 PUBLIC_BOT_URL = os.getenv("PUBLIC_BOT_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "2592000"))
@@ -26,9 +29,71 @@ TARGET_CHANNEL_ID = int(os.environ["TARGET_CHANNEL_ID"])
 CPANEL_INGEST_URL = os.environ["CPANEL_INGEST_URL"]
 CPANEL_INGEST_SECRET = os.environ["CPANEL_INGEST_SECRET"]
 CPANEL_MEDIA_URL = os.getenv("CPANEL_MEDIA_URL", "https://chalchitra.site/chitraengine/media").rstrip("?")
-CPANEL_PREPARE_URL = os.getenv("CPANEL_PREPARE_URL", "https://chalchitra.site/chitraengine/prepare")
 
-app = FastAPI(title="Telegram cPanel Channel Bot", version="3.0.0")
+app = FastAPI(title="Telegram cPanel Direct Stream Bot", version="4.0.0")
+
+UNSUPPORTED_EXTENSIONS = {".ts", ".avi", ".flv", ".wmv", ".vob", ".mpg", ".mpeg", ".m2ts", ".3gp"}
+SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+UNSUPPORTED_MIMES = {"video/mp2t", "video/mpeg", "video/x-msvideo", "video/x-flv", "video/x-ms-wmv"}
+QUALITY_RE = re.compile(r"(?<!\w)(2160|1440|1080|720|576|480|360|240|144)\s*[pP]\b")
+EPISODE_RE = re.compile(r"(?:episode|ep|e)\s*[:#-]?\s*(\d+)\b", re.IGNORECASE)
+SEASON_RE = re.compile(r"(?:season|s)\s*[:#-]?\s*(\d+)\b", re.IGNORECASE)
+
+LANGUAGE_PATTERNS = [
+    ("hindi", "Hindi"),
+    ("english", "English"),
+    ("tamil", "Tamil"),
+    ("telugu", "Telugu"),
+    ("malayalam", "Malayalam"),
+    ("bengali", "Bengali"),
+    ("japanese", "Japanese"),
+]
+
+
+@dataclass
+class Candidate:
+    source_chat_id: int
+    source_message_id: int
+    file_name: str
+    mime_type: str
+    file_size: int
+    caption: str
+    season: str
+    episode: str
+    quality: str
+    audio_language: str
+    channel_message_id: Optional[int] = None
+    channel_file_id: str = ""
+    channel_file_unique_id: str = ""
+    source_file_id: str = ""
+    source_file_unique_id: str = ""
+
+    @property
+    def episode_key(self) -> tuple[str, str]:
+        return self.season, self.episode
+
+    @property
+    def source_key(self) -> tuple[str, str, str, str]:
+        return self.season, self.episode, self.quality, self.audio_language
+
+
+@dataclass
+class ChatState:
+    bulk_prefix: Optional[str] = None
+    bulk_items: list[Candidate] = field(default_factory=list)
+    invalid_replacements: dict[tuple[str, str], str] = field(default_factory=dict)
+    pending_single: Optional[Candidate] = None
+    processing: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+states: dict[int, ChatState] = {}
+
+
+def state_for(chat_id: int) -> ChatState:
+    if chat_id not in states:
+        states[chat_id] = ChatState()
+    return states[chat_id]
 
 
 def b64url(data: bytes) -> str:
@@ -42,6 +107,97 @@ def sign_payload(payload: dict[str, Any]) -> str:
     return f"{encoded}.{b64url(signature)}"
 
 
+def make_channel_token(channel_message_id: int, file_size: int, file_name: str, mime: str) -> str:
+    now = int(time.time())
+    return sign_payload(
+        {
+            "v": 2,
+            "c": TARGET_CHANNEL_ID,
+            "m": channel_message_id,
+            "f": "",
+            "s": file_size,
+            "n": file_name[:180],
+            "t": mime[:100] or "video/mp4",
+            "iat": now,
+            "exp": now + TOKEN_TTL_SECONDS,
+        }
+    )
+
+
+def media_name(media: dict[str, Any]) -> str:
+    return str(media.get("file_name") or "video")
+
+
+def extension_of(name: str) -> str:
+    return PurePath(name.lower()).suffix
+
+
+def unsupported_reason(media: dict[str, Any], file_name: str) -> Optional[str]:
+    mime = str(media.get("mime_type") or "").lower()
+    ext = extension_of(file_name)
+    if ext in UNSUPPORTED_EXTENSIONS:
+        return f"{ext} file"
+    if mime in UNSUPPORTED_MIMES:
+        return f"{mime}"
+    return None
+
+
+def is_video_media(media: dict[str, Any], file_name: str) -> bool:
+    mime = str(media.get("mime_type") or "").lower()
+    ext = extension_of(file_name)
+    return mime.startswith("video/") or ext in SUPPORTED_EXTENSIONS or ext in UNSUPPORTED_EXTENSIONS
+
+
+def detect_metadata(caption: str) -> tuple[str, str, str, str]:
+    text = caption or ""
+    season_match = SEASON_RE.search(text)
+    season = f"S{int(season_match.group(1)):02d}" if season_match else "S01"
+    episode_match = EPISODE_RE.search(text)
+    if not episode_match:
+        raise ValueError("Episode number detect nahi hua. Description mein Episode 1, Ep1 ya E1 format hona chahiye.")
+    episode = str(int(episode_match.group(1))).zfill(2)
+    quality_match = QUALITY_RE.search(text)
+    quality = f"{quality_match.group(1)}p" if quality_match else ""
+    if not quality:
+        upper = text.upper()
+        if re.search(r"(?<!\w)2K\b", upper):
+            quality = "2k"
+        elif re.search(r"(?<!\w)4K\b", upper):
+            quality = "4k"
+    if not quality:
+        raise ValueError("Quality detect nahi hui. Description mein 720p, 1080p, 4K ya similar quality hona chahiye.")
+
+    lower = text.lower()
+    if "dual audio" in lower or "multi audio" in lower:
+        audio = "Dual Audio"
+    else:
+        found = [normalized for marker, normalized in LANGUAGE_PATTERNS if re.search(rf"\b{re.escape(marker)}\b", lower)]
+        audio = "Dual Audio" if len(found) >= 2 else (found[0] if found else "Unknown")
+    return season, episode, quality, audio
+
+
+def validate_prefix(prefix: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,120}", prefix))
+
+
+def validate_slug(slug: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,239}", slug))
+
+
+def help_text() -> str:
+    return (
+        "🎬 Telegram → GDPlayer direct stream\n\n"
+        "/bulk PREFIX-\n"
+        "Videos collect karo; links tabhi banenge jab /done bhejoge.\n\n"
+        "/done\n"
+        "Bulk queue process karke episode links banata hai.\n\n"
+        "Single video ke liye video bhejo, phir custom slug bhejo.\n"
+        "Example slug: JJK-S01-Ep-10\n\n"
+        "Caption me Season, Episode aur Quality hona chahiye.\n"
+        "Render video bytes handle nahi karta; stream Telegram → cPanel → viewer hota hai."
+    )
+
+
 async def telegram_api(method: str, data: dict[str, Any]) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     async with httpx.AsyncClient(timeout=60) as http:
@@ -53,46 +209,24 @@ async def telegram_api(method: str, data: dict[str, Any]) -> dict[str, Any]:
     return body["result"]
 
 
-async def send_bot_message(chat_id: int, text: str) -> None:
-    await telegram_api(
-        "sendMessage",
-        {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-    )
+async def send_bot_message(chat_id: int, text: str) -> dict[str, Any]:
+    return await telegram_api("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
 
 
 async def copy_to_database_channel(source_chat_id: int, source_message_id: int) -> dict[str, Any]:
-    # Telegram performs this copy internally; Render never downloads the media bytes.
     return await telegram_api(
         "copyMessage",
-        {
-            "chat_id": TARGET_CHANNEL_ID,
-            "from_chat_id": source_chat_id,
-            "message_id": source_message_id,
-        },
+        {"chat_id": TARGET_CHANNEL_ID, "from_chat_id": source_chat_id, "message_id": source_message_id},
     )
 
 
-def make_slug(value: str, fallback_id: int) -> str:
-    cleaned = "".join(ch if ch.isalnum() else "-" for ch in value).strip("-")
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return (cleaned[:240] or f"telegram-{fallback_id}")
-
-
-async def prepare_cpanel_media(record: dict[str, Any]) -> dict[str, Any]:
+async def save_gdplayer_metadata(record: dict[str, Any], sources: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    payload = dict(record)
+    if sources:
+        payload["sources"] = sources
     headers = {"X-CPANEL-INGEST-SECRET": CPANEL_INGEST_SECRET}
-    async with httpx.AsyncClient(timeout=30) as http:
-        response = await http.post(CPANEL_PREPARE_URL, json=record, headers=headers)
-        response.raise_for_status()
-        body = response.json()
-    if not body.get("ok"):
-        raise RuntimeError(body.get("error", "cPanel media preparation failed"))
-    return body
-
-
-async def save_gdplayer_metadata(record: dict[str, Any]) -> dict[str, Any]:
-    headers = {"X-CPANEL-INGEST-SECRET": CPANEL_INGEST_SECRET}
-    async with httpx.AsyncClient(timeout=30) as http:
-        response = await http.post(CPANEL_INGEST_URL, json=record, headers=headers)
+    async with httpx.AsyncClient(timeout=60) as http:
+        response = await http.post(CPANEL_INGEST_URL, json=payload, headers=headers)
         response.raise_for_status()
         body = response.json()
     if not body.get("ok"):
@@ -100,20 +234,205 @@ async def save_gdplayer_metadata(record: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def make_channel_token(channel_message_id: int, file_size: int, file_name: str, mime: str) -> str:
-    now = int(time.time())
-    payload = {
-        "v": 2,
-        "c": TARGET_CHANNEL_ID,
-        "m": channel_message_id,
-        "f": "",
-        "s": file_size,
-        "n": file_name[:180],
-        "t": mime[:100] or "video/mp4",
-        "iat": now,
-        "exp": now + TOKEN_TTL_SECONDS,
+def candidate_from_message(chat_id: int, message: dict[str, Any]) -> tuple[Optional[Candidate], Optional[str]]:
+    media = message.get("video") or message.get("document")
+    if not media:
+        return None, "Video bhejo. Sirf video/document media supported hai."
+    file_name = media_name(media)
+    if not is_video_media(media, file_name):
+        return None, "Yeh video file nahi lag rahi. MP4 ya supported video document bhejo."
+    reason = unsupported_reason(media, file_name)
+    caption = str(message.get("caption") or "")
+    try:
+        season, episode, quality, audio = detect_metadata(caption)
+    except ValueError as exc:
+        return None, str(exc) + " Video queue mein add nahi ki gayi."
+    candidate = Candidate(
+        source_chat_id=chat_id,
+        source_message_id=int(message["message_id"]),
+        file_name=file_name,
+        mime_type=str(media.get("mime_type") or "video/mp4"),
+        file_size=int(media.get("file_size") or 0),
+        caption=caption,
+        season=season,
+        episode=episode,
+        quality=quality,
+        audio_language=audio,
+        source_file_id=str(media.get("file_id") or ""),
+        source_file_unique_id=str(media.get("file_unique_id") or ""),
+    )
+    if reason:
+        return candidate, (
+            "❌ Unsupported video format\n\n"
+            f"Detected: {season} / Episode {episode}\n"
+            f"Format: {reason}\n\n"
+            f"Ye video format supported nahi hai. Please Episode {episode} ka supported-format replacement bhejo."
+        )
+    return candidate, None
+
+
+def copy_candidate_metadata(media: dict[str, Any], candidate: Candidate) -> None:
+    # Bot API copyMessage returns only the new message_id. Preserve the original
+    # Telegram identifiers; the channel message_id remains the authoritative stream key.
+    candidate.channel_file_id = str(media.get("file_id") or candidate.source_file_id)
+    candidate.channel_file_unique_id = str(media.get("file_unique_id") or candidate.source_file_unique_id)
+
+
+def stream_fields(candidate: Candidate) -> dict[str, Any]:
+    if not candidate.channel_message_id:
+        raise RuntimeError("channel message missing")
+    token = make_channel_token(candidate.channel_message_id, candidate.file_size, candidate.file_name, candidate.mime_type)
+    stream_url = f"{CPANEL_MEDIA_URL}?token={quote(token, safe='')}"
+    watch_url = f"{CPANEL_WATCH_URL}?token={quote(token, safe='')}"
+    return {"stream_url": stream_url, "watch_url": watch_url}
+
+
+def source_record(candidate: Candidate, slug: str) -> dict[str, Any]:
+    fields = stream_fields(candidate)
+    return {
+        "slug": slug,
+        "episode_slug": slug,
+        "season": candidate.season,
+        "episode": candidate.episode,
+        "quality": candidate.quality,
+        "audio_language": candidate.audio_language,
+        "channel_id": TARGET_CHANNEL_ID,
+        "channel_message_id": candidate.channel_message_id,
+        "source_chat_id": candidate.source_chat_id,
+        "source_message_id": candidate.source_message_id,
+        "title": candidate.file_name[:1000],
+        "file_id": candidate.channel_file_id or candidate.source_file_id,
+        "file_unique_id": candidate.channel_file_unique_id or candidate.source_file_unique_id,
+        "file_name": candidate.file_name[:180],
+        "mime_type": candidate.mime_type[:100] or "video/mp4",
+        "file_size": candidate.file_size,
+        "caption": candidate.caption,
+        "stream_url": fields["stream_url"],
     }
-    return sign_payload(payload)
+
+
+async def copy_candidate(candidate: Candidate) -> None:
+    copied = await copy_to_database_channel(candidate.source_chat_id, candidate.source_message_id)
+    candidate.channel_message_id = int(copied["message_id"])
+    copied_media = copied.get("video") or copied.get("document") or {}
+    copy_candidate_metadata(copied_media, candidate)
+
+
+async def handle_single_slug(chat_id: int, slug: str) -> None:
+    state = state_for(chat_id)
+    async with state.lock:
+        candidate = state.pending_single
+        if candidate is None:
+            await send_bot_message(chat_id, "Pehle video bhejo, phir custom slug bhejo.\n\n" + help_text())
+            return
+        if not validate_slug(slug):
+            await send_bot_message(chat_id, "❌ Slug invalid hai. Sirf letters, numbers, hyphen, underscore, dot ya tilde use karo.")
+            return
+        state.pending_single = None
+    try:
+        await copy_candidate(candidate)
+        record = source_record(candidate, slug)
+        saved = await save_gdplayer_metadata(record)
+        player_url = saved.get("slug_url") or saved.get("embed_url") or f"{CPANEL_WATCH_URL}?token={quote(stream_fields(candidate)['watch_url'].split('token=', 1)[-1], safe='')}"
+        await send_bot_message(chat_id, f"✅ Video ready\n\n🔗 {player_url}")
+    except Exception:
+        logger.exception("Single video processing failed")
+        await send_bot_message(chat_id, "❌ Video save nahi ho paya. cPanel/Telegram setup check karo.")
+
+
+async def handle_bulk_media(chat_id: int, message: dict[str, Any]) -> None:
+    state = state_for(chat_id)
+    candidate, error = candidate_from_message(chat_id, message)
+    if error:
+        await send_bot_message(chat_id, error)
+        if candidate is not None and error.startswith("❌ Unsupported video format"):
+            state.invalid_replacements[candidate.episode_key] = "replacement pending"
+        return
+
+    assert candidate is not None
+    async with state.lock:
+        if state.processing or not state.bulk_prefix:
+            await send_bot_message(chat_id, "Bulk mode active nahi hai. Single video ke liye video bhejo; bulk ke liye /bulk PREFIX- bhejo.")
+            return
+        if any(item.source_key == candidate.source_key for item in state.bulk_items):
+            await send_bot_message(chat_id, f"❌ Is episode ki ye quality already save hai: {candidate.season}-Ep-{candidate.episode}-{candidate.quality}. Duplicate source ignore kiya gaya.")
+            return
+    try:
+        await copy_candidate(candidate)
+    except Exception:
+        logger.exception("Bulk copy failed")
+        await send_bot_message(chat_id, "❌ Video ko private Telegram channel me copy nahi kar paya. Is episode ko queue me add nahi kiya.")
+        return
+    async with state.lock:
+        replacement = candidate.episode_key in state.invalid_replacements
+        state.bulk_items.append(candidate)
+        state.invalid_replacements.pop(candidate.episode_key, None)
+        prefix = state.bulk_prefix
+    await send_bot_message(
+        chat_id,
+        (
+            f"✅ Replacement accepted.\nDetected: {candidate.season} / Episode {candidate.episode} / {candidate.quality} / {candidate.audio_language}\n"
+            f"Episode {candidate.episode} queue mein update ho gaya."
+            if replacement else
+            f"✅ Video queue mein add ho gaya.\nDetected: {candidate.season} / Episode {candidate.episode} / {candidate.quality} / {candidate.audio_language}\n\n"
+            "Aur videos bhejo. Sab complete hone ke baad /done bhejo."
+        ),
+    )
+
+
+async def process_bulk(chat_id: int, prefix: str, items: list[Candidate], invalid: dict[tuple[str, str], str]) -> None:
+    grouped: dict[str, list[Candidate]] = {}
+    for item in items:
+        slug = f"{prefix}{item.season}-Ep-{item.episode}"
+        grouped.setdefault(slug, []).append(item)
+    complete_links: list[str] = []
+    for slug, candidates in grouped.items():
+        candidates.sort(key=lambda item: (item.quality, item.audio_language))
+        primary = candidates[0]
+        try:
+            sources = [source_record(item, slug) for item in candidates]
+            saved = await save_gdplayer_metadata(sources[0], sources=sources)
+            complete_links.append(saved.get("slug_url") or saved.get("embed_url") or slug)
+            await send_bot_message(
+                chat_id,
+                "✅ Episode ready\n"
+                f"Season: {primary.season}\nEpisode: {primary.episode}\n"
+                f"Sources: {', '.join(item.quality + ' • ' + item.audio_language for item in candidates)}\n\n"
+                f"🔗 {saved.get('slug_url') or saved.get('embed_url') or slug}",
+            )
+        except Exception:
+            logger.exception("Bulk episode ingest failed for %s", slug)
+            await send_bot_message(chat_id, f"❌ Episode {slug} save nahi ho paya.")
+    if invalid:
+        missing = ", ".join(f"{season}/Episode {episode}" for season, episode in sorted(invalid))
+        await send_bot_message(chat_id, f"⚠️ Replacement ke bina incomplete episodes: {missing}")
+    await send_bot_message(
+        chat_id,
+        f"✅ Bulk complete ho gaya.\nTotal valid videos: {len(items)}\nTotal episodes: {len(grouped)}\nLinks generated: {len(complete_links)}",
+    )
+
+
+async def finish_bulk(chat_id: int) -> None:
+    state = state_for(chat_id)
+    async with state.lock:
+        if not state.bulk_prefix:
+            await send_bot_message(chat_id, "Bulk mode active nahi hai. Pehle /bulk PREFIX- bhejo.")
+            return
+        if state.processing:
+            await send_bot_message(chat_id, "Bulk processing already chal rahi hai.")
+            return
+        prefix = state.bulk_prefix
+        items = list(state.bulk_items)
+        invalid = dict(state.invalid_replacements)
+        state.processing = True
+        state.bulk_prefix = None
+        state.bulk_items = []
+        state.invalid_replacements = {}
+    await send_bot_message(chat_id, "⏳ Bulk processing start ho gayi hai. Queued videos process ho rahe hain.")
+    try:
+        await process_bulk(chat_id, prefix, items, invalid)
+    finally:
+        state.processing = False
 
 
 async def process_update(update: dict[str, Any]) -> None:
@@ -122,92 +441,65 @@ async def process_update(update: dict[str, Any]) -> None:
         return
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    source_message_id = message.get("message_id")
-    if not isinstance(chat_id, int) or not isinstance(source_message_id, int):
+    message_id = message.get("message_id")
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
         return
-
-    media = message.get("video") or message.get("document")
-    if not media:
-        await send_bot_message(chat_id, "Video bhejo. Sirf video/document media supported hai.")
+    text = str(message.get("text") or "").strip()
+    if text.startswith("/start"):
+        await send_bot_message(chat_id, help_text())
         return
-
-    mime = str(media.get("mime_type") or "")
-    file_name = str(media.get("file_name") or "video")
-    is_video = mime.startswith("video/") or file_name.lower().endswith(
-        (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
-    )
-    if not is_video:
-        await send_bot_message(chat_id, "Yeh video file nahi lag rahi. MP4 ya video document bhejo.")
+    if text.startswith("/help"):
+        await send_bot_message(chat_id, help_text())
         return
-
-    file_size = int(media.get("file_size") or 0)
-    try:
-        copied = await copy_to_database_channel(chat_id, source_message_id)
-        channel_message_id = int(copied["message_id"])
-        copied_media = copied.get("video") or copied.get("document") or media
-        channel_file_id = str(copied_media.get("file_id") or media.get("file_id") or "")
-        channel_file_unique_id = str(copied_media.get("file_unique_id") or media.get("file_unique_id") or "")
-        file_name = str(copied_media.get("file_name") or media.get("file_name") or file_name)
-        mime = str(copied_media.get("mime_type") or media.get("mime_type") or mime)
-        file_size = int(copied_media.get("file_size") or media.get("file_size") or file_size or 0)
-        caption = str(message.get("caption") or copied.get("caption") or "")
-        title = file_name[:1000]
-        slug = make_slug(title.rsplit(".", 1)[0], channel_message_id)
-        token = make_channel_token(channel_message_id, file_size, file_name, mime)
-        watch_url = f"{CPANEL_WATCH_URL}?token={quote(token, safe='')}"
-        stream_url = f"{CPANEL_MEDIA_URL}?token={quote(token, safe='')}"
-        record = {
-            "slug": slug,
-            "channel_id": TARGET_CHANNEL_ID,
-            "channel_message_id": channel_message_id,
-            "source_chat_id": chat_id,
-            "source_message_id": source_message_id,
-            "title": title,
-            "file_id": channel_file_id,
-            "file_unique_id": channel_file_unique_id,
-            "file_name": file_name[:180],
-            "mime_type": mime[:100] or "video/mp4",
-            "file_size": file_size,
-            "caption": caption,
-            "stream_url": stream_url,
-        }
-        prepared = await prepare_cpanel_media(record)
-        if prepared.get("mode") == "processing":
-            await send_bot_message(
-                chat_id,
-                "⏳ Video browser-compatible format mein nahi hai.\n\n"
-                "cPanel par automatic conversion start ho gayi hai. Converted file private Telegram channel mein save hone ke baad final GDPlayer link bheja jayega.\n\n"
-                "Render video bytes handle nahi kar raha.",
-            )
+    if text.startswith("/bulk"):
+        prefix = text[5:].strip()
+        if not validate_prefix(prefix):
+            await send_bot_message(chat_id, "Usage: /bulk JJK-\nPrefix me sirf letters, numbers, underscore ya hyphen rakho.")
             return
-        saved = await save_gdplayer_metadata(record)
-        size_text = f"{file_size / (1024 * 1024):.1f} MB" if file_size else "unknown size"
-        player_url = saved.get("embed_url") or watch_url
-        await send_bot_message(
-            chat_id,
-            "✅ Video channel mein save ho gaya.\n\n"
-            f"Size: {size_text}\n"
-            "▶️ GDPlayer link:\n"
-            f"{player_url}\n\n"
-            "Render sirf copy command, metadata aur link handle karta hai. Video cPanel se Telegram channel ke through stream hoga.",
-        )
-    except Exception as exc:
-        logger.exception("Channel video processing failed: %s", exc)
-        await send_bot_message(chat_id, "Video process nahi ho paya. cPanel/Telegram setup check karo.")
+        state = state_for(chat_id)
+        async with state.lock:
+            state.bulk_prefix = prefix
+            state.bulk_items = []
+            state.invalid_replacements = {}
+            state.pending_single = None
+            state.processing = False
+        await send_bot_message(chat_id, f"✅ Bulk mode active: {prefix}\nVideos bhejo. Links ke liye end me /done bhejo.")
+        return
+    if text.startswith("/done"):
+        asyncio.create_task(finish_bulk(chat_id))
+        return
+    if text and not message.get("video") and not message.get("document"):
+        state = state_for(chat_id)
+        if state.pending_single is not None:
+            await handle_single_slug(chat_id, text)
+        else:
+            await send_bot_message(chat_id, "Command samajh nahi aaya. /help likho.")
+        return
+    if message.get("video") or message.get("document"):
+        state = state_for(chat_id)
+        if state.bulk_prefix:
+            await handle_bulk_media(chat_id, message)
+            return
+        candidate, error = candidate_from_message(chat_id, message)
+        if error:
+            await send_bot_message(chat_id, error)
+            return
+        assert candidate is not None
+        async with state.lock:
+            state.pending_single = candidate
+        await send_bot_message(chat_id, "🔗 Is video ke liye custom slug bhejo:")
+        return
+    await send_bot_message(chat_id, "Video bhejo ya /help likho.")
 
 
 async def set_telegram_webhook_once() -> bool:
     if not PUBLIC_BOT_URL:
         return True
-    data: dict[str, Any] = {
-        "url": f"{PUBLIC_BOT_URL}/telegram/webhook",
-        "allowed_updates": ["message"],
-    }
+    data: dict[str, Any] = {"url": f"{PUBLIC_BOT_URL}/telegram/webhook", "allowed_updates": ["message"]}
     if WEBHOOK_SECRET:
         data["secret_token"] = WEBHOOK_SECRET
     try:
         await telegram_api("setWebhook", data)
-        logger.info("Telegram webhook configured")
         return True
     except Exception as exc:
         logger.error("Webhook registration failed: %s", exc)
@@ -243,7 +535,7 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "service": "telegram-cpanel-channel-bot", "media_relay": False}
+    return {"ok": True, "service": "telegram-cpanel-direct-stream-bot", "media_relay": False, "conversion": False}
 
 
 @app.post("/telegram/webhook")
