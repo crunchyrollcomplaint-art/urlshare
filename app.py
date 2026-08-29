@@ -26,6 +26,14 @@ PUBLIC_BOT_URL = os.getenv("PUBLIC_BOT_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "2592000"))
 TARGET_CHANNEL_ID = int(os.environ["TARGET_CHANNEL_ID"])
+try:
+    PRIVATE_LINK_CHANNEL_ID = int(os.environ["PRIVATE_LINK_CHANNEL_ID"])
+except KeyError as exc:
+    raise RuntimeError("PRIVATE_LINK_CHANNEL_ID is required for the private website-link index channel") from exc
+except ValueError as exc:
+    raise RuntimeError("PRIVATE_LINK_CHANNEL_ID must be a valid integer Telegram chat ID") from exc
+if PRIVATE_LINK_CHANNEL_ID == TARGET_CHANNEL_ID:
+    raise RuntimeError("PRIVATE_LINK_CHANNEL_ID must be different from TARGET_CHANNEL_ID")
 CPANEL_INGEST_URL = os.environ["CPANEL_INGEST_URL"]
 CPANEL_INGEST_SECRET = os.environ["CPANEL_INGEST_SECRET"]
 CPANEL_MEDIA_URL = os.getenv("CPANEL_MEDIA_URL", "https://chalchitra.site/chitraengine/media").rstrip("?")
@@ -92,6 +100,8 @@ class ChatState:
 
 
 states: dict[int, ChatState] = {}
+link_index_messages: dict[str, int] = {}
+link_index_entries: dict[str, dict[str, str]] = {}
 
 
 def state_for(chat_id: int) -> ChatState:
@@ -286,6 +296,48 @@ async def copy_to_database_channel(source_chat_id: int, source_message_id: int) 
     )
 
 
+async def update_private_link_index(
+    series_key: str,
+    series_title: str,
+    slug: str,
+    season: str,
+    episode: str,
+    website_url: str,
+    post_ids: list[int],
+) -> None:
+    entries = link_index_entries.setdefault(series_key, {})
+    ids = ", ".join(str(message_id) for message_id in post_ids)
+    entries[slug] = (
+        f"• {season} E{episode}\n"
+        f"➥ ᴡᴇʙ ʟɪɴᴋ: {website_url}\n"
+        f"➤ ᴘᴏꜱᴛ ɪᴅ: {ids}"
+    )
+    heading = series_title or series_key.split("|", 1)[-1]
+    text = f"➤ {heading}\n\n" + "\n\n".join(entries.values())
+    message_id = link_index_messages.get(series_key)
+    if message_id is None:
+        sent = await telegram_api(
+            "sendMessage",
+            {"chat_id": PRIVATE_LINK_CHANNEL_ID, "text": text, "disable_web_page_preview": True},
+        )
+        link_index_messages[series_key] = int(sent["message_id"])
+        return
+    try:
+        await telegram_api(
+            "editMessageText",
+            {"chat_id": PRIVATE_LINK_CHANNEL_ID, "message_id": message_id, "text": text, "disable_web_page_preview": True},
+        )
+    except TelegramAPIError as exc:
+        if exc.http_status == 400 and "message to edit not found" in exc.description.lower():
+            sent = await telegram_api(
+                "sendMessage",
+                {"chat_id": PRIVATE_LINK_CHANNEL_ID, "text": text, "disable_web_page_preview": True},
+            )
+            link_index_messages[series_key] = int(sent["message_id"])
+            return
+        raise
+
+
 async def save_gdplayer_metadata(record: dict[str, Any], sources: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     payload = dict(record)
     if sources:
@@ -365,7 +417,7 @@ def source_record(candidate: Candidate, slug: str, series_title: str = "") -> di
     fields = stream_fields(candidate)
     title = candidate.file_name[:1000]
     if series_title:
-        title = f"[title {candidate.season} Ep {candidate.episode} • {series_title}]"[:1000]
+        title = f"{candidate.season} Ep • {candidate.episode} {series_title}"[:1000]
     return {
         "slug": slug,
         "episode_slug": slug,
@@ -524,17 +576,33 @@ async def process_bulk(
     for slug, candidates in grouped.items():
         candidates.sort(key=lambda item: (item.quality, item.audio_language))
         primary = candidates[0]
+        copied_candidates = list(candidates)
         try:
             sources = [source_record(item, slug, series_title) for item in candidates]
             saved = await save_gdplayer_metadata(sources[0], sources=sources)
-            complete_links.append(saved.get("slug_url") or saved.get("embed_url") or slug)
+            website_url = saved.get("slug_url") or saved.get("embed_url") or f"{CPANEL_WATCH_URL}{slug}"
+            complete_links.append(website_url)
             await send_bot_message(
                 chat_id,
                 "✅ Episode ready\n"
                 f"Season: {primary.season}\nEpisode: {primary.episode}\n"
                 f"Sources: {', '.join(item.quality + ' • ' + item.audio_language for item in candidates)}\n\n"
-                f"🔗 {saved.get('slug_url') or saved.get('embed_url') or slug}",
+                f"🔗 {website_url}",
             )
+            try:
+                await update_private_link_index(
+                    series_key=f"{prefix}|{series_title}",
+                    series_title=series_title,
+                    slug=slug,
+                    season=primary.season,
+                    episode=primary.episode,
+                    website_url=website_url,
+                    post_ids=[item.channel_message_id for item in copied_candidates if item.channel_message_id],
+                )
+            except Exception as index_exc:
+                logger.exception("Private link index update failed for %s", slug)
+                detail = str(index_exc).replace("\n", " ")[:500]
+                await send_bot_message(chat_id, f"⚠️ Episode {slug} save ho gaya, lekin private link index update nahi ho paya.\nReason: {detail}")
         except Exception as exc:
             logger.exception("Bulk episode ingest failed for %s", slug)
             detail = str(exc).replace("\n", " ")[:500]
