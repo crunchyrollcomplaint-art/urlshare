@@ -82,6 +82,7 @@ class Candidate:
 @dataclass
 class ChatState:
     bulk_prefix: Optional[str] = None
+    bulk_series_title: str = ""
     bulk_items: list[Candidate] = field(default_factory=list)
     pending_bulk: dict[tuple[int, int], tuple[Candidate, str]] = field(default_factory=dict)
     invalid_replacements: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -190,7 +191,8 @@ def validate_slug(slug: str) -> bool:
 def help_text() -> str:
     return (
         "🎬 Telegram → GDPlayer direct stream\n\n"
-        "/bulk PREFIX-\n"
+        "/bulk PREFIX- SERIES TITLE\n"
+        "Example: /bulk Naruto- Naruto\n"
         "Videos collect karo; links tabhi banenge jab /done bhejoge.\n\n"
         "/done\n"
         "Bulk queue process karke episode links banata hai.\n\n"
@@ -359,8 +361,11 @@ def stream_fields(candidate: Candidate) -> dict[str, Any]:
     return {"stream_url": stream_url, "watch_url": watch_url}
 
 
-def source_record(candidate: Candidate, slug: str) -> dict[str, Any]:
+def source_record(candidate: Candidate, slug: str, series_title: str = "") -> dict[str, Any]:
     fields = stream_fields(candidate)
+    title = candidate.file_name[:1000]
+    if series_title:
+        title = f"[title {candidate.season} Ep {candidate.episode} • {series_title}]"[:1000]
     return {
         "slug": slug,
         "episode_slug": slug,
@@ -372,7 +377,7 @@ def source_record(candidate: Candidate, slug: str) -> dict[str, Any]:
         "channel_message_id": candidate.channel_message_id,
         "source_chat_id": candidate.source_chat_id,
         "source_message_id": candidate.source_message_id,
-        "title": candidate.file_name[:1000],
+        "title": title,
         "file_id": candidate.channel_file_id or candidate.source_file_id,
         "file_unique_id": candidate.channel_file_unique_id or candidate.source_file_unique_id,
         "file_name": candidate.file_name[:180],
@@ -504,7 +509,13 @@ async def handle_bulk_media(chat_id: int, message: dict[str, Any]) -> None:
     )
 
 
-async def process_bulk(chat_id: int, prefix: str, items: list[Candidate], invalid: dict[tuple[str, str], str]) -> None:
+async def process_bulk(
+    chat_id: int,
+    prefix: str,
+    items: list[Candidate],
+    invalid: dict[tuple[str, str], str],
+    series_title: str = "",
+) -> None:
     grouped: dict[str, list[Candidate]] = {}
     for item in items:
         slug = f"{prefix}{item.season}-Ep-{item.episode}"
@@ -514,7 +525,7 @@ async def process_bulk(chat_id: int, prefix: str, items: list[Candidate], invali
         candidates.sort(key=lambda item: (item.quality, item.audio_language))
         primary = candidates[0]
         try:
-            sources = [source_record(item, slug) for item in candidates]
+            sources = [source_record(item, slug, series_title) for item in candidates]
             saved = await save_gdplayer_metadata(sources[0], sources=sources)
             complete_links.append(saved.get("slug_url") or saved.get("embed_url") or slug)
             await send_bot_message(
@@ -547,16 +558,18 @@ async def finish_bulk(chat_id: int) -> None:
             await send_bot_message(chat_id, "Bulk processing already chal rahi hai.")
             return
         prefix = state.bulk_prefix
+        series_title = state.bulk_series_title
         items = list(state.bulk_items)
         invalid = dict(state.invalid_replacements)
         pending = dict(state.pending_bulk)
         state.processing = True
         state.bulk_prefix = None
+        state.bulk_series_title = ""
         state.bulk_items = []
         state.invalid_replacements = {}
     await send_bot_message(chat_id, "⏳ Bulk processing start ho gayi hai. Queued videos process ho rahe hain.")
     try:
-        await process_bulk(chat_id, prefix, items, invalid)
+        await process_bulk(chat_id, prefix, items, invalid, series_title)
         if pending:
             pending_lines = "\n".join(
                 f"• Episode {candidate.episode}: {reason}"
@@ -587,18 +600,22 @@ async def process_update(update: dict[str, Any]) -> None:
         await send_bot_message(chat_id, help_text())
         return
     if text.startswith("/bulk"):
-        prefix = text[5:].strip()
+        bulk_args = text[5:].strip()
+        prefix, _, series_title = bulk_args.partition(" ")
+        series_title = series_title.strip()
         if not validate_prefix(prefix):
-            await send_bot_message(chat_id, "Usage: /bulk JJK-\nPrefix me sirf letters, numbers, underscore ya hyphen rakho.")
+            await send_bot_message(chat_id, "Usage: /bulk PREFIX- SERIES TITLE\nExample: /bulk Naruto- Naruto")
             return
         state = state_for(chat_id)
         async with state.lock:
             state.bulk_prefix = prefix
+            state.bulk_series_title = series_title
             state.bulk_items = []
             state.invalid_replacements = {}
             state.pending_single = None
             state.processing = False
-        await send_bot_message(chat_id, f"✅ Bulk mode active: {prefix}\nVideos bhejo. Links ke liye end me /done bhejo.")
+        title_note = f"\nSeries title: {series_title}" if series_title else ""
+        await send_bot_message(chat_id, f"✅ Bulk mode active: {prefix}{title_note}\nVideos bhejo. Links ke liye end me /done bhejo.")
         return
     if text.startswith("/done"):
         asyncio.create_task(finish_bulk(chat_id))
