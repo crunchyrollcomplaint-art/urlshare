@@ -45,9 +45,9 @@ app = FastAPI(title="Telegram cPanel Direct Stream Bot", version="4.0.0")
 UNSUPPORTED_EXTENSIONS = {".ts", ".avi", ".flv", ".wmv", ".vob", ".mpg", ".mpeg", ".m2ts", ".3gp"}
 SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 UNSUPPORTED_MIMES = {"video/mp2t", "video/mpeg", "video/x-msvideo", "video/x-flv", "video/x-ms-wmv"}
-QUALITY_RE = re.compile(r"(?<!\w)(2160|1440|1080|720|576|480|360|240|144)\s*[pP]\b")
-EPISODE_RE = re.compile(r"(?:episode|ep|e)\s*[:#-]?\s*(\d+)\b", re.IGNORECASE)
-SEASON_RE = re.compile(r"(?:season|s)\s*[:#-]?\s*(\d+)\b", re.IGNORECASE)
+QUALITY_RE = re.compile(r"(?<![A-Za-z0-9])(2160|1440|1080|720|576|480|360|240|144)\s*[pP](?=$|[\s._-])")
+EPISODE_RE = re.compile(r"(?:episode|ep|e)[\s:#._-]*(\d+)(?=$|[\s._-])", re.IGNORECASE)
+SEASON_RE = re.compile(r"(?:season|s)[\s:#._-]*(\d+)(?=$|[\s._-])", re.IGNORECASE)
 
 LANGUAGE_PATTERNS = [
     ("hindi", "Hindi"),
@@ -174,9 +174,9 @@ def detect_metadata(caption: str) -> tuple[str, str, str, str]:
     quality = f"{quality_match.group(1)}p" if quality_match else ""
     if not quality:
         upper = text.upper()
-        if re.search(r"(?<!\w)2K\b", upper):
+        if re.search(r"(?<![A-Za-z0-9])2K(?=$|[\s._-])", upper):
             quality = "2k"
-        elif re.search(r"(?<!\w)4K\b", upper):
+        elif re.search(r"(?<![A-Za-z0-9])4K(?=$|[\s._-])", upper):
             quality = "4k"
     if not quality:
         raise ValueError("Quality detect nahi hui. Description mein 720p, 1080p, 4K ya similar quality hona chahiye.")
@@ -188,6 +188,15 @@ def detect_metadata(caption: str) -> tuple[str, str, str, str]:
         found = [normalized for marker, normalized in LANGUAGE_PATTERNS if re.search(rf"\b{re.escape(marker)}\b", lower)]
         audio = "Dual Audio" if len(found) >= 2 else (found[0] if found else "Unknown")
     return season, episode, quality, audio
+
+
+def detect_metadata_with_fallback(caption: str, file_name: str) -> tuple[str, str, str, str]:
+    if caption.strip():
+        try:
+            return detect_metadata(caption)
+        except ValueError:
+            pass
+    return detect_metadata(file_name)
 
 
 def validate_prefix(prefix: str) -> bool:
@@ -370,7 +379,7 @@ def candidate_from_message(chat_id: int, message: dict[str, Any]) -> tuple[Optio
     reason = unsupported_reason(media, file_name)
     caption = str(message.get("caption") or "")
     try:
-        season, episode, quality, audio = detect_metadata(caption)
+        season, episode, quality, audio = detect_metadata_with_fallback(caption, file_name)
     except ValueError as exc:
         return None, str(exc) + " Video queue mein add nahi ki gayi."
     candidate = Candidate(
@@ -417,7 +426,7 @@ def source_record(candidate: Candidate, slug: str, series_title: str = "") -> di
     fields = stream_fields(candidate)
     title = candidate.file_name[:1000]
     if series_title:
-        title = f"{candidate.season} Ep • {candidate.episode} {series_title}"[:1000]
+        title = f"{candidate.season} Ep {candidate.episode} • {series_title}"[:1000]
     return {
         "slug": slug,
         "episode_slug": slug,
