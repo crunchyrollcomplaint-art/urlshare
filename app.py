@@ -434,9 +434,6 @@ def source_record(candidate: Candidate, slug: str, series_title: str = "") -> di
         "episode": candidate.episode,
         "quality": candidate.quality,
         "audio_language": candidate.audio_language,
-        # Keep quality and dub language attached to the same source record.
-        # The player uses this label to build a separate quality list per language.
-        "label": f"{candidate.quality} • {candidate.audio_language}",
         "channel_id": TARGET_CHANNEL_ID,
         "channel_message_id": candidate.channel_message_id,
         "source_chat_id": candidate.source_chat_id,
@@ -586,17 +583,7 @@ async def process_bulk(
         grouped.setdefault(slug, []).append(item)
     complete_links: list[str] = []
     for slug, candidates in grouped.items():
-        candidates.sort(key=lambda item: (item.audio_language, item.quality))
-        # Send exactly one source for each uploaded quality within each dub.
-        # Never inherit or synthesize a quality from another language.
-        unique_candidates: list[Candidate] = []
-        seen_quality_language: set[tuple[str, str]] = set()
-        for item in candidates:
-            key = (item.audio_language, item.quality)
-            if key not in seen_quality_language:
-                seen_quality_language.add(key)
-                unique_candidates.append(item)
-        candidates = unique_candidates
+        candidates.sort(key=lambda item: (item.quality, item.audio_language))
         primary = candidates[0]
         copied_candidates = list(candidates)
         try:
