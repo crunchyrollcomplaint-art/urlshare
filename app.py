@@ -1,10 +1,13 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -14,148 +17,142 @@ from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("tg-cpanel-metadata-bot")
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-STREAM_SECRET = os.environ["STREAM_SECRET"].encode("utf-8")
+STREAM_SECRET = os.environ["STREAM_SECRET"].encode()
 CPANEL_WATCH_URL = os.environ["CPANEL_WATCH_URL"].rstrip("?")
 PUBLIC_BOT_URL = os.getenv("PUBLIC_BOT_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "2592000"))
+CPANEL_INGEST_URL = os.getenv("CPANEL_INGEST_URL", "").rstrip("/")
+INGEST_SECRET = os.getenv("INGEST_SECRET", "").encode()
+app = FastAPI(title="Telegram cPanel Metadata Bot", version="3.0.0")
 
-app = FastAPI(title="Telegram cPanel Metadata Bot", version="2.0.0")
+@dataclass
+class QueuedVideo:
+    chat_id: int; message_id: int; file_id: str; file_size: int; filename: str; caption: str; mime: str
 
+bulk_sessions: dict[int, dict[str, Any]] = {}
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
+def b64url(data: bytes) -> str: return base64.urlsafe_b64encode(data).decode().rstrip("=")
 def sign_payload(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    encoded = b64url(raw)
-    signature = hmac.new(STREAM_SECRET, encoded.encode("ascii"), hashlib.sha256).digest()
-    return f"{encoded}.{b64url(signature)}"
-
+    encoded = b64url(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
+    return encoded + "." + b64url(hmac.new(STREAM_SECRET, encoded.encode(), hashlib.sha256).digest())
+def make_stream_payload(item: QueuedVideo) -> tuple[str, dict[str, Any]]:
+    now = int(time.time())
+    payload = {"v":2,"c":item.chat_id,"m":item.message_id,"f":item.file_id,"s":item.file_size,"n":item.filename,"t":item.mime or "video/mp4","iat":now,"exp":now+TOKEN_TTL_SECONDS}
+    return sign_payload(payload), payload
 
 async def send_bot_message(chat_id: int, text: str) -> None:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as http:
-        response = await http.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-        response.raise_for_status()
+        r = await http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":text,"disable_web_page_preview":True}); r.raise_for_status()
 
+async def sync_cpanel(item: QueuedVideo, stream_url: str, slug: str, season: int, episode: int, quality: str, audio: str) -> tuple[bool,str]:
+    if not CPANEL_INGEST_URL or not INGEST_SECRET: return True, "not-configured"
+    data={"slug":slug,"title":slug,"season":season,"episode":episode,"quality":quality,"audio_language":audio,"telegram_chat_id":item.chat_id,"telegram_message_id":item.message_id,"telegram_file_id":item.file_id,"original_filename":item.filename,"original_caption":item.caption,"mime_type":item.mime or "video/mp4","file_size":item.file_size,"signed_stream_url":stream_url}
+    body=json.dumps(data,separators=(",",":"),ensure_ascii=False); stamp=str(int(time.time())); sig=hmac.new(INGEST_SECRET,(stamp+"."+body).encode(),hashlib.sha256).hexdigest()
+    async with httpx.AsyncClient(timeout=30) as http:
+        r=await http.post(CPANEL_INGEST_URL,content=body.encode(),headers={"Content-Type":"application/json","X-Ingest-Timestamp":stamp,"X-Ingest-Signature":sig}); r.raise_for_status(); result=r.json()
+    return bool(result.get("ok")), str(result.get("error", ""))
 
 async def set_telegram_webhook_once() -> bool:
-    if not PUBLIC_BOT_URL:
-        return True
-    webhook_url = f"{PUBLIC_BOT_URL}/telegram/webhook"
-    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    data: dict[str, Any] = {"url": webhook_url, "allowed_updates": ["message"]}
-    if WEBHOOK_SECRET:
-        data["secret_token"] = WEBHOOK_SECRET
+    if not PUBLIC_BOT_URL: return True
+    data={"url":PUBLIC_BOT_URL+"/telegram/webhook","allowed_updates":["message"]}
+    if WEBHOOK_SECRET: data["secret_token"]=WEBHOOK_SECRET
     try:
-        async with httpx.AsyncClient(timeout=30) as http:
-            response = await http.post(api_url, json=data)
-            response.raise_for_status()
-        logger.info("Telegram webhook configured at %s", webhook_url)
-        return True
-    except httpx.HTTPStatusError as exc:
-        logger.error("Telegram webhook registration failed: HTTP %s - %s", exc.response.status_code, exc.response.text[:500])
-    except Exception as exc:
-        logger.error("Telegram webhook registration failed: %s", exc)
-    return False
-
-
+        async with httpx.AsyncClient(timeout=30) as http: r=await http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",json=data); r.raise_for_status()
+        logger.info("Telegram webhook configured"); return True
+    except Exception as exc: logger.error("Webhook registration failed: %s",exc); return False
 async def webhook_retry_loop() -> None:
-    delay = 5
+    delay=5
     while True:
-        if await set_telegram_webhook_once():
-            return
-        logger.warning("Webhook will be retried in %s seconds", delay)
-        await __import__("asyncio").sleep(delay)
-        delay = min(delay * 2, 300)
+        if await set_telegram_webhook_once(): return
+        await asyncio.sleep(delay); delay=min(delay*2,300)
 
+def detect(caption: str) -> tuple[Optional[int],Optional[int],Optional[str],str]:
+    text=caption or ""
+    season_match=re.search(r"(?:season\s*[:#-]?\s*|\bS\s*[-:]?\s*)(\d+)\b",text,re.I)
+    season=int(season_match.group(1)) if season_match else 1
+    ep_match=re.search(r"(?:episode|ep|e)\s*[:#-]?\s*(\d+)\b",text,re.I)
+    episode=int(ep_match.group(1)) if ep_match else None
+    quality=None
+    for pattern,value in [(r"(?:web[- ]?dl|hdrip|hevc)\s*(\d{3,4})\s*p?",None),(r"\b(2160|1440|1080|720|576|480|360|240|144)\s*p?\b",None),(r"\b(2k|4k)\b",None)]:
+        m=re.search(pattern,text,re.I)
+        if m: quality=(m.group(1).lower()+("p" if m.group(1).isdigit() else "")); break
+    audio="Unknown"
+    langs=[("Dual Audio",r"(?:hindi.*english|english.*hindi|dual\s+audio|multi\s+audio)"),("Hindi",r"hindi(?:\s+dub)?"),("English",r"english(?:\s+dub)?"),("Tamil",r"tamil(?:\s+dub)?"),("Telugu",r"telugu(?:\s+dub)?"),("Malayalam",r"malayalam(?:\s+dub)?"),("Bengali",r"bengali(?:\s+dub)?"),("Japanese",r"japanese(?:\s+dub)?")]
+    for label,pattern in langs:
+        if re.search(pattern,text,re.I): audio=label; break
+    return season,episode,quality,audio
 
-async def process_update(update: dict[str, Any]) -> None:
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    message_id = message.get("message_id")
-    if not isinstance(chat_id, int) or not isinstance(message_id, int):
-        return
+def item_from_message(message: dict[str,Any]) -> Optional[QueuedVideo]:
+    media=message.get("video") or message.get("document")
+    if not media: return None
+    mime=str(media.get("mime_type") or ""); filename=str(media.get("file_name") or "video")
+    if not (mime.startswith("video/") or filename.lower().endswith((".mp4",".mkv",".webm",".mov",".avi",".m4v"))): return None
+    return QueuedVideo(int(message["chat"]["id"]),int(message["message_id"]),str(media.get("file_id") or ""),int(media.get("file_size") or 0),filename,str(message.get("caption") or ""),mime or "video/mp4")
 
-    media = message.get("video") or message.get("document")
-    if not media:
-        await send_bot_message(chat_id, "Video bhejo. Abhi test MVP mein sirf video/document media supported hai.")
-        return
+async def publish_one(item: QueuedVideo, prefix: str) -> tuple[bool,str,str]:
+    season,episode,quality,audio=detect(item.caption)
+    if episode is None: return False,"episode",""
+    if quality is None: return False,"quality",""
+    slug=f"{prefix}S{season:02d}-Ep-{episode:02d}" if episode<100 else f"{prefix}S{season:02d}-Ep-{episode}"
+    token,_=make_stream_payload(item); url=f"{CPANEL_WATCH_URL}?token={quote(token,safe='')}"
+    ok,err=await sync_cpanel(item,url,slug,season,episode,quality,audio)
+    return ok,slug+"|"+quality+"|"+audio,err
 
-    mime = str(media.get("mime_type") or "")
-    file_name = str(media.get("file_name") or "video")
-    is_video = mime.startswith("video/") or file_name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"))
-    if not is_video:
-        await send_bot_message(chat_id, "Yeh video file nahi lag rahi. MP4 ya video document bhejkar test karo.")
-        return
+async def finish_bulk(chat_id:int, session:dict[str,Any]) -> None:
+    await send_bot_message(chat_id,"⏳ Bulk processing started. Queued videos are being processed.")
+    results=[]; errors=[]
+    for item in session["queue"]:
+        ok,key,err=await publish_one(item,session["prefix"])
+        if ok: results.append(key)
+        else: errors.append((key,item))
+    grouped:dict[str,list[str]]={}
+    for key in results:
+        slug,quality,audio=key.split("|",2); grouped.setdefault(slug,[]).append(f"{quality} • {audio}")
+    for slug,sources in grouped.items(): await send_bot_message(chat_id,"✅ Episode ready\n\n"+slug+"\n"+"\n".join(sorted(set(sources)))+f"\n\n🔗 {CPANEL_WATCH_URL.split('/watch.php')[0]}/e/{quote(slug)}")
+    if errors:
+        for kind,item in errors: await send_bot_message(chat_id,"Episode number not detected. Description mein valid Episode format chahiye." if kind=="episode" else "Quality not detected. Description mein 720p, 1080p, 4K ya similar hona chahiye.")
+    await send_bot_message(chat_id,f"✅ Bulk complete.\n\nTotal videos: {len(session['queue'])}\nTotal episodes: {len(grouped)}\nLinks generated: {len(grouped)}")
 
-    file_id = str(media.get("file_id") or "")
-    if not file_id:
-        await send_bot_message(chat_id, "Telegram file reference nahi mila. Is file ko dobara video/document ke roop mein bhejo.")
-        return
-
-    file_size = int(media.get("file_size") or 0)
-    now = int(time.time())
-    payload = {
-        "v": 2,
-        "c": chat_id,
-        "m": message_id,
-        "f": file_id,
-        "s": file_size,
-        "n": file_name[:180],
-        "t": mime[:100] or "video/mp4",
-        "iat": now,
-        "exp": now + TOKEN_TTL_SECONDS,
-    }
-    token = sign_payload(payload)
-    watch_url = f"{CPANEL_WATCH_URL}?token={quote(token, safe='')}"
-    size_text = f"{file_size / (1024 * 1024):.1f} MB" if file_size else "unknown size"
-    text = (
-        "✅ Video receive ho gaya.\n\n"
-        f"Size: {size_text}\n"
-        "▶️ Stream link:\n"
-        f"{watch_url}\n\n"
-        "Render sirf link/reference banata hai. Video cPanel se direct Telegram origin par stream hoga."
-    )
-    await send_bot_message(chat_id, text)
-
+async def process_update(update:dict[str,Any]) -> None:
+    message=update.get("message") or update.get("edited_message")
+    if not message or not isinstance(message.get("chat",{}).get("id"),int): return
+    chat_id=int(message["chat"]["id"]); text=str(message.get("text") or "").strip()
+    if text.lower().startswith("/bulk"):
+        prefix=text[5:].strip()
+        if not prefix: await send_bot_message(chat_id,"Usage: /bulk PREFIX-"); return
+        bulk_sessions[chat_id]={"prefix":prefix,"queue":[]}; await send_bot_message(chat_id,f"✅ Bulk mode active. Prefix: {prefix}\nVideos bhejo; finish ke liye /done bhejo."); return
+    if text.lower()=="/done":
+        session=bulk_sessions.pop(chat_id,None)
+        if not session: await send_bot_message(chat_id,"Koi active bulk session nahi hai."); return
+        await finish_bulk(chat_id,session); return
+    item=item_from_message(message)
+    if not item:
+        if text.startswith("/"): return
+        await send_bot_message(chat_id,"Video bhejo. Video/document media supported hai."); return
+    if not item.file_id: await send_bot_message(chat_id,"Telegram file reference nahi mila."); return
+    session=bulk_sessions.get(chat_id)
+    if session is not None:
+        season,episode,quality,audio=detect(item.caption)
+        if episode is None: await send_bot_message(chat_id,"Episode number not detected. Video queue mein add nahi hua."); return
+        if quality is None: await send_bot_message(chat_id,"Quality not detected. Video queue mein add nahi hua."); return
+        session["queue"].append(item); await send_bot_message(chat_id,f"✅ Video added to queue.\nDetected: S{season:02d} / Episode {episode} / {quality} / {audio}\n\nSend more videos. When finished, send /done."); return
+    season,episode,quality,audio=detect(item.caption)
+    token,_=make_stream_payload(item); url=f"{CPANEL_WATCH_URL}?token={quote(token,safe='')}"
+    if CPANEL_INGEST_URL and episode is not None and quality is not None: await sync_cpanel(item,url,"single-S01-Ep-"+str(episode),season,episode,quality,audio)
+    await send_bot_message(chat_id,"✅ Video receive ho gaya.\n\n▶️ Stream link:\n"+url+"\n\nRender sirf link/reference banata hai. Video cPanel se direct Telegram origin par stream hoga.")
 
 @app.on_event("startup")
-async def startup() -> None:
-    import asyncio
-    app.state.webhook_task: Optional[asyncio.Task] = None
-    if PUBLIC_BOT_URL:
-        app.state.webhook_task = asyncio.create_task(webhook_retry_loop())
-
-
+async def startup():
+    app.state.webhook_task=asyncio.create_task(webhook_retry_loop()) if PUBLIC_BOT_URL else None
 @app.on_event("shutdown")
-async def shutdown() -> None:
-    task = getattr(app.state, "webhook_task", None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except __import__("asyncio").CancelledError:
-            pass
-
-
+async def shutdown():
+    task=getattr(app.state,"webhook_task",None)
+    if task and not task.done(): task.cancel()
 @app.get("/health")
-async def health() -> dict[str, Any]:
-    return {"ok": True, "service": "telegram-cpanel-metadata-bot", "media_relay": False}
-
-
+async def health(): return {"ok":True,"service":"telegram-cpanel-metadata-bot","media_relay":False}
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)) -> JSONResponse:
-    if WEBHOOK_SECRET and not hmac.compare_digest(x_telegram_bot_api_secret_token or "", WEBHOOK_SECRET):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
-    update = await request.json()
-    import asyncio
-    asyncio.create_task(process_update(update))
-    return JSONResponse({"ok": True})
+async def telegram_webhook(request:Request,x_telegram_bot_api_secret_token:Optional[str]=Header(default=None)):
+    if WEBHOOK_SECRET and not hmac.compare_digest(x_telegram_bot_api_secret_token or "",WEBHOOK_SECRET): raise HTTPException(401,"Invalid webhook secret")
+    asyncio.create_task(process_update(await request.json())); return JSONResponse({"ok":True})
