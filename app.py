@@ -218,7 +218,7 @@ async def process_update(update: dict[str, Any]) -> None:
         await send_bot_message(chat_id, "Video link bana, lekin catalog database sync fail hua. Render logs check karo.")
         logger.error("cPanel ingest failed: %s", error)
         return
-    await send_bot_message(chat_id, "✅ Video saved.\n\nEmbed URL:\nhttps://chalchitra.site/e/{quote(slug)}\n\nIs URL ko direct open ya iframe mein use kar sakte ho. Video cPanel se direct stream hoga; Render media relay nahi karta.")
+    await send_bot_message(chat_id, f"✅ Video saved.\n\nEmbed URL:\nhttps://chalchitra.site/e/{quote(slug)}\n\nIs URL ko direct open ya iframe mein use kar sakte ho. Video cPanel se direct stream hoga; Render media relay nahi karta.")
 
 @app.on_event("startup")
 async def startup() -> None:
