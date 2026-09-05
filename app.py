@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import time
+import tempfile
+import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
@@ -40,6 +42,7 @@ class QueuedVideo:
 
 bulk_sessions: dict[int, dict[str, Any]] = {}
 pending_slugs: dict[int, str] = {}
+multiaudio_sessions: dict[int, dict[str, Any]] = {}
 
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
@@ -63,10 +66,46 @@ async def send_bot_message(chat_id: int, text: str) -> None:
         r = await http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
         r.raise_for_status()
 
-async def sync_cpanel(item: QueuedVideo, media_url: str, slug: str, season: int, episode: int, quality: str, audio: str) -> tuple[bool, str]:
+async def inspect_media(item: QueuedVideo) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Inspect the uploaded Telegram document without changing the legacy /bulk path."""
+    async with httpx.AsyncClient(timeout=60) as http:
+        file_resp = await http.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": item.file_id})
+        file_resp.raise_for_status()
+        file_path = file_resp.json().get("result", {}).get("file_path")
+        if not file_path:
+            raise RuntimeError("Telegram file path unavailable")
+        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        with tempfile.NamedTemporaryFile(suffix=".media") as tmp:
+            async with http.stream("GET", download_url) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    tmp.write(chunk)
+            tmp.flush()
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name,codec_long_name,channels,bit_rate:stream_disposition=default,forced:stream_tags=language,title", "-of", "json", tmp.name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(err.decode(errors="replace")[:500] or "ffprobe failed")
+    streams = json.loads(out.decode("utf-8", errors="replace")).get("streams", [])
+    audios, subtitles = [], []
+    for ordinal, stream in enumerate(streams, 1):
+        kind = stream.get("codec_type")
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        label = tags.get("language") or tags.get("title") or (f"Audio {ordinal}" if kind == "audio" else f"Subtitle {ordinal}")
+        row = {"index": int(stream.get("index", ordinal - 1)), "label": str(label), "language": str(tags.get("language") or ""), "title": str(tags.get("title") or ""), "codec": str(stream.get("codec_name") or ""), "default": bool(disposition.get("default")), "forced": bool(disposition.get("forced"))}
+        if kind == "audio":
+            row.update({"channels": int(stream.get("channels") or 0), "bitrate": int(stream.get("bit_rate") or 0) if str(stream.get("bit_rate") or "").isdigit() else 0})
+            audios.append(row)
+        elif kind == "subtitle":
+            subtitles.append(row)
+    return audios, subtitles
+
+async def sync_cpanel(item: QueuedVideo, media_url: str, slug: str, season: int, episode: int, quality: str, audio: str, audio_tracks: Optional[list[dict[str, Any]]] = None, subtitle_tracks: Optional[list[dict[str, Any]]] = None, workflow: str = "bulk") -> tuple[bool, str]:
     if not CPANEL_INGEST_URL or not INGEST_SECRET:
         return True, "not-configured"
-    data = {"slug": slug, "title": slug, "season": season, "episode": episode, "quality": quality, "audio_language": audio, "telegram_chat_id": item.chat_id, "telegram_message_id": item.message_id, "telegram_file_id": item.file_id, "original_filename": item.filename, "original_caption": item.caption, "mime_type": item.mime or "video/mp4", "file_size": item.file_size, "signed_stream_url": media_url}
+    data = {"slug": slug, "title": slug, "season": season, "episode": episode, "quality": quality, "audio_language": audio, "telegram_chat_id": item.chat_id, "telegram_message_id": item.message_id, "telegram_file_id": item.file_id, "original_filename": item.filename, "original_caption": item.caption, "mime_type": item.mime or "video/mp4", "file_size": item.file_size, "signed_stream_url": media_url, "workflow": workflow, "audio_tracks": audio_tracks or [], "subtitle_tracks": subtitle_tracks or []}
     body = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     stamp = str(int(time.time()))
     signature = hmac.new(INGEST_SECRET, (stamp + "." + body).encode(), hashlib.sha256).hexdigest()
@@ -119,6 +158,31 @@ async def publish_one(item: QueuedVideo, slug: str) -> tuple[bool, str]:
     ok, _ = await sync_cpanel(item, media_url, slug, season, episode, quality, audio)
     return ok, f"{slug}|{quality}|{audio}"
 
+async def publish_multiaudio(chat_id: int, item: QueuedVideo, session: dict[str, Any]) -> tuple[bool, str]:
+    season, episode, quality, _ = detect(item.caption)
+    if episode is None or quality is None:
+        return False, "Caption must include episode and manual quality (for example: Episode 1 1080p)."
+    try:
+        audios, subtitles = await inspect_media(item)
+        if not audios:
+            return False, "No embedded audio tracks found."
+        media_url = make_stream_url(item)
+        ok, error = await sync_cpanel(item, media_url, session["slug"], season, episode, quality, "Multi-Audio", audios, subtitles, "bulkm")
+        return (ok, f"{quality}: {len(audios)} audio / {len(subtitles)} subtitle tracks") if ok else (False, error)
+    except Exception as exc:
+        logger.exception("Multi-audio inspection failed")
+        return False, f"Media inspection failed: {exc}"
+
+async def finish_multiaudio(chat_id: int, session: dict[str, Any]) -> None:
+    results, errors = [], []
+    for item in session["queue"]:
+        ok, message = await publish_multiaudio(chat_id, item, session)
+        (results if ok else errors).append(message)
+    if results:
+        await send_bot_message(chat_id, "✅ Multi-Audio complete\n\n" + session["slug"] + "\n" + "\n".join(results) + f"\n\n🔗 {CPANEL_WATCH_URL.split('/watch.php')[0]}/e/{quote(session['slug'])}")
+    for error in errors:
+        await send_bot_message(chat_id, "❌ " + error)
+
 async def finish_bulk(chat_id: int, session: dict[str, Any]) -> None:
     await send_bot_message(chat_id, "⏳ Bulk processing started. Queued videos are being processed.")
     results: list[str] = []
@@ -151,6 +215,14 @@ async def process_update(update: dict[str, Any]) -> None:
         return
     chat_id = int(message["chat"]["id"])
     text = str(message.get("text") or "").strip()
+    if text.lower().startswith("/bulkm"):
+        slug = safe_slug(text[6:].strip())
+        if not slug:
+            await send_bot_message(chat_id, "Usage: /Bulkm SLUG")
+            return
+        multiaudio_sessions[chat_id] = {"slug": slug, "queue": []}
+        await send_bot_message(chat_id, f"✅ Multi-Audio mode active: {slug}\nSend videos with captions containing Episode and manual quality. Finish with /done.")
+        return
     if text.lower().startswith("/bulk"):
         prefix = safe_slug(text[5:].strip())
         if not prefix:
@@ -161,6 +233,10 @@ async def process_update(update: dict[str, Any]) -> None:
         await send_bot_message(chat_id, f"✅ Bulk mode active. Prefix: {prefix}\nVideos bhejo; finish ke liye /done bhejo.")
         return
     if text.lower() == "/done":
+        multi = multiaudio_sessions.pop(chat_id, None)
+        if multi:
+            await finish_multiaudio(chat_id, multi)
+            return
         session = bulk_sessions.pop(chat_id, None)
         if not session:
             await send_bot_message(chat_id, "Koi active bulk session nahi hai.")
@@ -189,6 +265,14 @@ async def process_update(update: dict[str, Any]) -> None:
         return
     if not item.file_id:
         await send_bot_message(chat_id, "Telegram file reference nahi mila.")
+        return
+    if chat_id in multiaudio_sessions:
+        season, episode, quality, _ = detect(item.caption)
+        if episode is None or quality is None:
+            await send_bot_message(chat_id, "Multi-Audio queue mein add nahi hua. Caption mein Episode 1 aur manual quality 1080p/720p do.")
+            return
+        multiaudio_sessions[chat_id]["queue"].append(item)
+        await send_bot_message(chat_id, f"✅ Multi-Audio video queued: Episode {episode} / {quality}. Send more or /done.")
         return
     if chat_id in bulk_sessions:
         season, episode, quality, audio = detect(item.caption)
