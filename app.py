@@ -27,6 +27,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "2592000"))
 CPANEL_INGEST_URL = os.getenv("CPANEL_INGEST_URL", "").rstrip("/")
 INGEST_SECRET = os.getenv("INGEST_SECRET", "").encode()
+CPANEL_INSPECT_URL = os.getenv("CPANEL_INSPECT_URL", "").rstrip("/")
 CPANEL_MEDIA_BASE = os.getenv("CPANEL_MEDIA_BASE", CPANEL_WATCH_URL.replace("/watch.php", "/streamx")).rstrip("/")
 app = FastAPI(title="Telegram cPanel Metadata Bot", version="3.1.0")
 
@@ -68,6 +69,20 @@ async def send_bot_message(chat_id: int, text: str) -> None:
 
 async def inspect_media(item: QueuedVideo) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Inspect the uploaded Telegram document without changing the legacy /bulk path."""
+    if CPANEL_INSPECT_URL and INGEST_SECRET:
+        body = json.dumps({"telegram_chat_id": item.chat_id, "telegram_message_id": item.message_id, "telegram_file_id": item.file_id}, separators=(",", ":"))
+        stamp = str(int(time.time()))
+        signature = hmac.new(INGEST_SECRET, (stamp + "." + body).encode(), hashlib.sha256).hexdigest()
+        async with httpx.AsyncClient(timeout=900) as http:
+            response = await http.post(CPANEL_INSPECT_URL, content=body.encode(), headers={"Content-Type": "application/json", "X-Inspect-Timestamp": stamp, "X-Inspect-Signature": signature})
+            response.raise_for_status()
+            result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "cPanel media inspection failed"))
+        return result.get("audio_tracks", []), result.get("subtitle_tracks", [])
+
+    # Fallback for small files when no cPanel inspection endpoint is configured.
+    # Telegram Bot API getFile has a hard download-size limit; large files must use MTProto above.
     async with httpx.AsyncClient(timeout=60) as http:
         file_resp = await http.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": item.file_id})
         file_resp.raise_for_status()
