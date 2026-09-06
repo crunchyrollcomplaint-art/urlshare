@@ -98,7 +98,8 @@ async def get_embedded_audio_tracks(item: QueuedVideo) -> list[dict[str, Any]]:
 async def sync_cpanel(item: QueuedVideo, media_url: str, slug: str, season: int, episode: int, quality: str, audio: str) -> tuple[bool, str]:
     if not CPANEL_INGEST_URL or not INGEST_SECRET:
         return True, "not-configured"
-    data = {"slug": slug, "title": slug, "season": season, "episode": episode, "quality": quality, "audio_language": audio, "telegram_chat_id": item.chat_id, "telegram_message_id": item.message_id, "telegram_file_id": item.file_id, "original_filename": item.filename, "original_caption": item.caption, "mime_type": item.mime or "video/mp4", "file_size": item.file_size, "signed_stream_url": media_url}
+    data = {"slug": slug, "title": slug, "season": season, "episode": episode, "quality": quality, "audio_language": audio, "multi_audio": audio == "Multi Audio", "telegram_chat_id": item.chat_id, "telegram_message_id": item.message_id, "telegram_file_id": item.file_id, "original_filename": item.filename, "original_caption": item.caption, "mime_type": item.mime or "video/mp4", "file_size": item.file_size, "signed_stream_url": media_url}
+    logger.info("Catalog ingest slug=%s multi_audio=%s audio=%s url_has_flag=%s", slug, audio == "Multi Audio", audio, "multi_audio=1" in media_url)
     body = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     stamp = str(int(time.time()))
     signature = hmac.new(INGEST_SECRET, (stamp + "." + body).encode(), hashlib.sha256).hexdigest()
@@ -190,7 +191,7 @@ async def finish_mbulk(chat_id: int, session: dict[str, Any]) -> None:
             errors.append("Quality not detected for one video.")
             continue
         slug = f"{session['prefix']}S{season:02d}-Ep-{episode:02d}" if episode < 100 else f"{session['prefix']}S{season:02d}-Ep-{episode}"
-        media_url = make_stream_url(item) + "&multi_audio=1"
+        media_url = make_stream_url(item, multi_audio=True)
         ok, error = await sync_cpanel(item, media_url, slug, season, episode, quality, "Multi Audio")
         if ok:
             results.append(slug)
@@ -209,8 +210,9 @@ async def process_update(update: dict[str, Any]) -> None:
         return
     chat_id = int(message["chat"]["id"])
     text = str(message.get("text") or "").strip()
-    if text.lower().startswith("/mbulk"):
-        prefix = safe_slug(text[6:].strip())
+    command = text.split(maxsplit=1)[0].lower() if text else ""
+    if command == "/mbulk" or command.startswith("/mbulk@"):
+        prefix = safe_slug(text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else "")
         if not prefix:
             await send_bot_message(chat_id, "Usage: /mbulk CUSTOM_PREFIX")
             return
@@ -218,8 +220,8 @@ async def process_update(update: dict[str, Any]) -> None:
         pending_slugs.pop(chat_id, None)
         await send_bot_message(chat_id, f"✅ Multi-audio mode active. Prefix: {prefix}\nMulti-audio videos bhejo; finish ke liye /done bhejo.")
         return
-    if text.lower().startswith("/bulk"):
-        prefix = safe_slug(text[5:].strip())
+    if command == "/bulk" or command.startswith("/bulk@"):
+        prefix = safe_slug(text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else "")
         if not prefix:
             await send_bot_message(chat_id, "Usage: /bulk CUSTOM_PREFIX")
             return
