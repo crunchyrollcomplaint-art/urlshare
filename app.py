@@ -290,7 +290,9 @@ async def finish_bulkm(chat_id: int, session: dict[str, Any]) -> None:
             if not ok:
                 raise RuntimeError(error or "catalog sync failed")
             successes += 1
-            await send_bot_message(chat_id, f"✅ Saved S{session['season']:02d} Episode {episode} ({quality})\nAudio tracks: {len(audio_tracks)}\nSubtitle tracks: {len(subtitle_tracks)}")
+            player_base = CPANEL_WATCH_URL.split('/watch.php')[0].rstrip('/')
+            player_url = f"{player_base}/e/{quote(slug)}"
+            await send_bot_message(chat_id, f"✅ Saved S{session['season']:02d} Episode {episode} ({quality})\nAudio tracks: {len(audio_tracks)}\nSubtitle tracks: {len(subtitle_tracks)}\n\n🔗 Player URL:\n{player_url}")
         except Exception as exc:
             logger.exception("Bulkm item failed for chat=%s message=%s", chat_id, getattr(item.get("video"), "message_id", "unknown"))
             errors.append(f"Episode {item.get('episode', '?')} ({item.get('quality', '?')}): {str(exc)[:180]}")
